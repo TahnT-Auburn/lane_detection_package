@@ -1,0 +1,16 @@
+/**:
+  ros__parameters:
+    conf_threshold: 0.5
+    nms_threshold: 0.4
+    inp_width: 416 #224
+    inp_height: 416 #224
+    device: "cpu"
+    input_type: "image"
+    input_path: "/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/lane_detection_package/data/images/frame1265.jpg"
+    write_output: false
+    output_file: "/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/yolo_package/output/images/test_image.jpg"
+    classes_file: "/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/yolo_toolbox/classes/coco.names"
+    model_configuration: "/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/yolo_toolbox/cfg/yolov3.cfg"
+    model_weights: "/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/yolo_toolbox/weights/yolov3.weights"
+    camera_matrix_vector: [2.8669527693619584e+03, 0., 6.400000000000000e+02, 0., 2.8669527693619584e+03, 3.6000000000000000e+02, 0., 0., 1.]
+    dist_coeffs: [ -1.6652509493273235e-01, 9.7738779215728377e-01, 0., 0., 0. ]

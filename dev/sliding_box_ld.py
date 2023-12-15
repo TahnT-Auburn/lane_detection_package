@@ -1,0 +1,931 @@
+import os
+import glob
+
+import cv2 as cv
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+
+#----- Read Image -----
+def readImage(input_path):
+    
+    #Read image
+    frame = cv.imread(input_path, cv.IMREAD_COLOR)
+    return frame
+
+# ----- Get Output Layers for YOLO-----
+def getOutputLayers(net):
+    
+    layer_names = net.getLayerNames()
+    try:
+        output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+    except:
+        output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+        
+    return output_layers
+
+# ----- Draw YOLO Predictions ------
+def drawPredictions(frame, class_id, confidence, x, y, x_plus_w, y_plus_h):
+    
+    #Classes path
+    classes = '/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/yolo_toolbox/classes/coco.names'
+    with open(classes, 'r') as f:
+        classes = [line.strip() for line in f.readlines()]
+    
+    #Draw bounding box and class name
+    label = str(classes[class_id])
+    color = (0,255,65)
+    cv.rectangle(frame, (x,y), (x_plus_w, y_plus_h), color, 1)
+    #cv.putText(frame, label, (x-10,y-10), cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+# ------ Run YOLO -----
+def runYolo(frame):
+    
+    #Classes path
+    classes = '/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/yolo_toolbox/classes/coco.names'
+    with open(classes, 'r') as f:
+        classes = [line.strip() for line in f.readlines()]
+        
+    #Image specs
+    img_width = frame.shape[1]
+    img_height = frame.shape[0]
+
+    #Read in Darknet
+    weights = '/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/yolo_toolbox/weights/yolov3.weights'
+    config = '/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/yolo_toolbox/cfg/yolov3.cfg'
+    net = cv.dnn.readNet(weights,config)
+    
+    #Create a 4D blob
+    blob = cv.dnn.blobFromImage(frame, 1/255, (416,416), (0,0,0), True, False)
+    
+    #Sets input to network
+    net.setInput(blob)
+    
+    #Run forward pass to get output of the ouput layers
+    outs = net.forward(getOutputLayers(net))
+    
+    #Initialize
+    class_ids = []
+    confidences = []
+    boxes = []
+    conf_threshold = 0.6
+    nms_threshold = 0.4
+    
+    width_vect = []
+    bottom_vect = []
+    for out in outs:
+        for detection in out:
+        
+            #Parse detections
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            obj_label = str(classes[class_id])
+            
+            #Filter non-vehicle objects
+            if obj_label == 'car' or obj_label == 'truck' or obj_label == 'bus':
+                
+                #Filter low confidence objects
+                if confidence > conf_threshold:
+                    
+                    #Generate bounding boxes
+                    center_x = int(detection[0] * img_width)
+                    center_y = int(detection[1] * img_height)
+                    w = int(detection[2] * img_width)
+                    h = int(detection[3] * img_height)
+                    x = center_x - w / 2
+                    y = center_y - h / 2
+                    
+                    #Append arrays
+                    class_ids.append(class_id)
+                    confidences.append(float(confidence))
+                    boxes.append([x,y,w,h])
+
+                    #Append width and bottom vectors for virtual horizon estiamtion
+                    bottom = y + h
+                    width_vect.append(w)
+                    bottom_vect.append(bottom)
+                    
+    #Non-maximum suppression
+    indices = cv.dnn.NMSBoxes(boxes, confidences, conf_threshold, nms_threshold)
+    
+    for i in indices:
+        try:
+            box = boxes[i]
+        except:
+            i = i[0]
+            box = boxes[i]
+        
+        x = box[0]
+        y = box[1]
+        w = box[2]
+        h = box[3]
+        
+        #Draw bounding boxes
+        drawPredictions(frame, class_ids[i], confidences[i], round(x), round(y), round(x+w), round(y+h))
+        
+    #Display
+    cv.imshow("YOLO Detection", frame)
+    cv.waitKey(0)
+    
+    return indices, boxes, width_vect, bottom_vect
+
+#----- Binary Thresholding -----
+def binaryThresholding(frame):
+    
+    #Set channel limits
+    gradient_thresh = (20, 100)
+    s_thresh = (80, 255)
+    l_thresh = (80, 255)
+    b_thresh = (150, 200)
+    l2_thresh = (225, 255)
+
+    #HLS conversion
+    hls = cv.cvtColor(frame, cv.COLOR_BGR2HLS)
+    h, l, s = cv.split(hls)
+
+    #LAB conversion
+    lab = cv.cvtColor(frame, cv.COLOR_BGR2Lab)
+    l2, a, b = cv.split(lab)
+
+    #LUV conversion
+    luv = cv.cvtColor(frame, cv.COLOR_BGR2Luv)
+    l3, u, v = cv.split(luv)
+    
+    #Binary from LAB and LUV
+    binary_bl = np.zeros_like(l2)
+    binary_bl[
+        ((b > b_thresh[0]) & (b <= b_thresh[1])) |
+        ((l3 > l2_thresh[0]) & (l3 <= l2_thresh[1]))
+    ] = 1
+
+    binary_bl_plot = binary_bl * 255
+
+    #Binary from HLS
+    binary_sl = np.zeros_like(h)
+    binary_sl[
+        ((s > s_thresh[0]) & (s <= s_thresh[1])) &
+        ((l > l_thresh[0]) & (l <= l_thresh[1]))
+    ] = 1
+
+    binary_sl_plot = binary_sl * 255
+
+    #Sobel filtering
+    sobelx = cv.Sobel(s, cv.CV_64F, 1, 0)
+    abs_sobelx = np.absolute(sobelx)
+    scaled_sobel = np.uint8(255*abs_sobelx/np.max(abs_sobelx))
+    binary_s = np.zeros_like(scaled_sobel)
+    binary_s[(scaled_sobel >= gradient_thresh[0]) & (scaled_sobel <= gradient_thresh[1])] = 1
+
+    binary_s_plot = binary_s * 255
+
+    #Combine two binary images to view contribution
+    comb_binary = np.dstack((binary_s, binary_bl, np.zeros_like(binary_s))) * 255
+    
+    #Display
+    cv.imshow('B/L Binary', binary_bl_plot)
+    cv.waitKey(0)
+
+    
+    return binary_bl
+
+#----- Mask Image -----
+def maskImage(binary_bl, indices, boxes, frame):
+    
+    #Initialize mask
+    frame_size = frame.shape[::-1][1:] #width by height
+    mask = np.zeros(frame.shape[:2], np.uint8) 
+    
+    #Generate general mask (tol > 0 for trapezoid, tol = 0 for triangle)
+    tol = 275 #tunable
+    height_scale = 4.5
+    mask_points = np.array([
+        [frame_size[0]/2 - tol, frame_size[1]/height_scale],   # Top-left corner
+        [0, frame_size[1]],                         # Bottom-left corner
+        [frame_size[0], frame_size[1]],             # Bottom-right corner
+        [frame_size[0]/2 + tol, frame_size[1]/height_scale]    # Top-right corner
+    ])
+    cv.fillPoly(mask, np.int32([mask_points]), color=(255,255,255))
+    
+    #Generate mask from YOLO detections
+    for i in indices:
+        try:
+            box = boxes[i]
+        except:
+            i = i[0]
+            box = boxes[i]
+        
+        x = box[0]
+        y = box[1]
+        w = box[2]
+        h = box[3]
+
+        detect_points = np.array([
+            [x, y],             # Top-left corner
+            [x, y + h],         # Bottom-left corner
+            [x + w, y + h],     # Bottom-right corner
+            [x + w, y]          # Top-right corner
+        ])
+        cv.fillPoly(mask, np.int32([detect_points]), color=(0,0,0))
+    
+    #Display mask
+    cv.imshow("Mask", mask)
+    cv.waitKey(0)
+
+    #Perform masking via bitwise_and
+    masked_binary = cv.bitwise_and(binary_bl, binary_bl, mask=mask)
+
+    return mask, masked_binary
+
+#----- Vanishing Point via Hough Lines -----
+def vanishPoint(frame, mask):
+    
+    #Grayscale raw image
+    gray_frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+    
+    #Gaussian smoothing
+    kernel_size = 11
+    smooth_frame = cv.GaussianBlur(gray_frame, (kernel_size,kernel_size), 0, 0)
+    
+    #Perform canny edge detection on masked binary
+    min_thresh = 60
+    max_thresh = 150
+    edge_frame = cv.Canny(smooth_frame, min_thresh, max_thresh)
+    
+    #Mask edge frame
+    masked_edge = cv.bitwise_and(edge_frame, edge_frame, mask=mask)
+    
+    #Perform Hough transform
+    rho = 1
+    pi = 3.14159265358979323846                     
+    theta = pi/180
+    threshold = 45
+    min_line_length = 25
+    max_line_gap = 15
+    max_angle = 85
+    min_angle = 30
+    
+    hough_lines = cv.HoughLinesP(masked_edge, rho, theta, threshold, min_line_length, max_line_gap)
+
+    #Process hough lines if they are detected
+    line_frame = frame.copy()
+    if hough_lines is not None:
+        
+        #Initialize vectors 
+        left_vect = []      #left lane points
+        right_vect = []     #right lane points
+        x_vect_l = []         #Seperate items for least squares (left)
+        y_vect_l =[]
+        x_squared_vect_l = []
+        xy_vect_l = []
+        x_vect_r = []         #Seperate items for least squares (right)
+        y_vect_r =[]
+        x_squared_vect_r = []
+        xy_vect_r = []
+        for i in range(0, len(hough_lines)):    #iterate through hough lines output
+            
+            #Plot points as given (check)
+            points = hough_lines[i][0]
+            
+            #calculate slope
+            m = (points[3] - points[1]) / (points[2] - points[0])
+            
+            #filter out lines with invalid angles
+            angle = math.atan(np.abs(m)) * (1/theta)
+            if (angle >= min_angle and angle <= max_angle):
+                
+                #Separate left lane (neg slope - remember y down is +)
+                if (m < 0):
+                    
+                    #Draw points
+                    cv.line(line_frame, (points[0], points[1]), (points[2], points[3]), (0,0,255), 3, cv.LINE_AA)
+                    cv.circle(line_frame, (points[0], points[1]), 10, (255,255,0),3)
+                    cv.circle(line_frame, (points[2], points[3]), 10, (255,255,0),3)
+            
+                    #append left vector
+                    left_vect.append(points)
+                    
+                    #append items for least squares
+                    x1 = points[0]
+                    x2 = points[2]
+                    y1 = points[1]
+                    y2 = points[3]
+                    x_squared1 = x1**2
+                    x_squared2 = x2**2
+                    xy1 = x1*y1
+                    xy2 = x2*y2
+                    x_vect_l.extend([x1,x2])
+                    y_vect_l.extend([y1,y2])
+                    x_squared_vect_l.extend([x_squared1,x_squared2])
+                    xy_vect_l.extend([xy1,xy2])
+                
+                #Separate right lane (positive slope)
+                if (m > 0):
+                    
+                    #Draw points
+                    cv.line(line_frame, (points[0], points[1]), (points[2], points[3]), (0,0,255), 3, cv.LINE_AA)
+                    cv.circle(line_frame, (points[0], points[1]), 10, (128,0,128),3)
+                    cv.circle(line_frame, (points[2], points[3]), 10, (128,0,128),3)
+                    
+                    #append right vector
+                    right_vect.append(points)
+
+                    #append items for least squares
+                    x1 = points[0]
+                    x2 = points[2]
+                    y1 = points[1]
+                    y2 = points[3]
+                    x_squared1 = x1**2
+                    x_squared2 = x2**2
+                    xy1 = x1*y1
+                    xy2 = x2*y2
+                    x_vect_r.extend([x1,x2])
+                    y_vect_r.extend([y1,y2])
+                    x_squared_vect_r.extend([x_squared1,x_squared2])
+                    xy_vect_r.extend([xy1,xy2])
+                   
+        #Check for valid detections for BOTH lanes
+        if (np.array(left_vect).size > 0 and np.array(right_vect).size > 0):
+            
+            #Perform least squares on Hough points
+            N_l = len(x_vect_l)
+            m_l = (N_l * np.sum(xy_vect_l) - np.sum(x_vect_l) * np.sum(y_vect_l)) / (N_l * np.sum(x_squared_vect_l) - (np.sum(x_vect_l))**2)
+            b_l = (np.sum(y_vect_l) - m_l * np.sum(x_vect_l)) / N_l
+            N_r = len(x_vect_r)
+            m_r = (N_r * np.sum(xy_vect_r) - np.sum(x_vect_r) * np.sum(y_vect_r)) / (N_r * np.sum(x_squared_vect_r) - (np.sum(x_vect_r))**2)
+            b_r = (np.sum(y_vect_r) - m_r * np.sum(x_vect_r)) / N_r
+            
+            #X-point of intersection
+            x_intersect = int((b_r - b_l) / (m_l - m_r))
+            
+            
+            line_frame2 = line_frame.copy()
+            left_y_vect = []
+            right_y_vect = []
+            for x in range(0, frame.shape[1]):
+                left_y = m_l*x + b_l
+                left_y_vect.append(left_y)
+                right_y = m_r*x + b_r
+                right_y_vect.append(right_y)
+
+                #Generate vanishing point
+                if x == x_intersect:
+                    vert_vanish_point = int(left_y)
+
+            #Display
+            cv.line(line_frame2, (0,int(left_y_vect[0])), (frame.shape[1],int(left_y_vect[frame.shape[1]-1])),(0,140,255), 3, cv.LINE_AA)
+            cv.line(line_frame2, (0,int(right_y_vect[0])), (frame.shape[1],int(right_y_vect[frame.shape[1]-1])),(0,140,255), 3, cv.LINE_AA)
+            cv.line(line_frame2, (0,vert_vanish_point), (frame.shape[1], vert_vanish_point), (0,255,255), 3, cv.LINE_AA)
+            cv.line(line_frame2, (0,90), (frame.shape[1], 90), (255,255,255), 3, cv.LINE_AA)
+            cv.circle(line_frame2, (x_intersect, vert_vanish_point), 10, (0,0,255), 3)
+            cv.imshow('Hough Lines', line_frame)
+            cv.waitKey(0)
+            cv.imshow('Test', line_frame2)
+            cv.waitKey(0)  
+        
+        else:
+            print('Invalid lane detections')
+            vert_vanish_point = 0    
+    else:
+        print('Invalid hough lines')
+        vert_vanish_point = 0
+    
+    return vert_vanish_point
+
+#----- Virtual Horizon via Vehicle detections ----
+def virtHorizon(frame, width_vect, bottom_vect):
+    
+    #Height of camera (m)
+    camera_height = 2.27
+    
+    #Average vehicle width (m)
+    avg_veh_width = 1.82
+    
+    #Width tolerance (m)
+    min_veh_width = 1.4
+    max_veh_width = 2.6
+    
+    #Initial virt horizon calculation
+    avg_width = np.sum(width_vect) / len(width_vect)
+    avg_bottom = np.sum(bottom_vect) / len(bottom_vect)
+    virtual_horizon = avg_bottom - (camera_height * (avg_width / avg_veh_width))
+
+    #length
+    length = len(bottom_vect)
+    
+    #Feedback loop
+    i = 0
+    while i < 5:
+        
+        #Print virtual horizon
+        print(f'Virtual Horizon: {virtual_horizon}')
+        
+        #Initialize valid vectors (Reinitialize every feedback loop)
+        width_vect_val = []
+        bottom_vect_val = []
+
+        #Filter out detections
+        for j in range(0, len(bottom_vect)):
+            
+            print(f'Test: {len(bottom_vect)}')
+            
+            lower_lim = ((bottom_vect[j] - virtual_horizon) / camera_height) * min_veh_width
+            upper_lim = ((bottom_vect[j] - virtual_horizon) / camera_height) * max_veh_width
+            
+            if (width_vect[j] >= lower_lim and width_vect[j] <= upper_lim):
+                
+                #Append valid vectors
+                width_vect_val.append(width_vect[j])
+                bottom_vect_val.append(bottom_vect[j])
+                
+        
+        #Recalculate virtual horizon
+        avg_width = np.sum(width_vect_val) / len(width_vect_val)
+        avg_bottom = np.sum(bottom_vect_val) / len(bottom_vect_val)
+        virtual_horizon = avg_bottom - (camera_height * (avg_width / avg_veh_width))
+        
+        #Update bottom and width vectors
+        width_vect = width_vect_val
+        bottom_vect = bottom_vect_val
+        
+        i+=1
+    
+    #Filter invalid virtual horizon values
+    if virtual_horizon < 0 or virtual_horizon > frame.shape[0]:
+        virtual_horizon = 0
+    
+    return virtual_horizon
+        
+#----- Inverse Perspective Mapping -----
+def invPersTrans(masked_binary, frame):
+    
+    frame_size = frame.shape[::-1][1:] #width by height
+    offset = 570 #tunable
+    tol = 75 #tunable
+    height_scale = 4.5 #tunable
+    src_points = np.float32([
+        (frame_size[0]/2 - tol, frame_size[1]/height_scale),    # Top-left corner
+        (0, frame_size[1]),                                     # Bottom-left corner
+        (frame_size[0], frame_size[1]),                         # Bottom-right corner
+        (frame_size[0]/2 + tol, frame_size[1]/height_scale)     # Top-right corner
+    ])
+
+    dst_points = np.float32([
+        [offset, 0], 
+        [offset, frame_size[1]],
+        [frame_size[0]-offset, frame_size[1]], 
+        [frame_size[0]-offset, 0]
+    ])
+
+    trans_mat = cv.getPerspectiveTransform(src_points, dst_points)
+    inv_trans_mat = cv.getPerspectiveTransform(dst_points, src_points)
+
+    warped_frame = cv.warpPerspective(frame, trans_mat, frame_size, flags=cv.INTER_LINEAR)
+    warped_binary = cv.warpPerspective(masked_binary, trans_mat, frame_size, flags=cv.INTER_LINEAR)
+    
+    #Display warped raw as a check
+    cv.imshow("IPM Frame", warped_frame)
+    cv.waitKey(0)
+
+    return warped_binary, inv_trans_mat
+
+#----- Histogram -----
+def histogram(warped_binary):
+    
+    #Generate and plot histogram
+    histogram = np.sum(warped_binary[int(warped_binary.shape[0]/2):,:], axis=0)
+ 
+    #Separate left and right bases/lanes
+    midpoint = np.int(histogram.shape[0]/2)
+    left_peak = np.argmax(histogram[:midpoint])
+    right_peak = np.argmax(histogram[midpoint:]) + midpoint
+    
+    #Filter low pixel content
+    min_pix_count = 10
+    if histogram[left_peak] < min_pix_count:
+        left_peak = 0
+    if histogram[right_peak] < min_pix_count:
+        right_peak = 0
+    
+    print(f'left peak: {left_peak}')
+    print(f'right peak: {right_peak}')
+    print(f'dist: {right_peak - left_peak}')
+
+    #Plotting
+    font = {'family':'serif','color':'black','size':15}
+    plt.plot(histogram)
+    plt.title('Binary Histogram', fontdict=font)
+    plt.xlabel('Image Width [pixels]', fontdict=font)
+    plt.ylabel('Sum of Binary Pixel Values [pixels]', fontdict=font)
+    plt.show()
+    
+    return left_peak, right_peak
+
+#----- Sliding Window -----
+def slidingWindow(warped_binary, left_peak, right_peak):
+    
+    #Tunable sliding window parameters
+    window_num = 12     #number of sliding windows
+    margin = 40        #lateral margin 
+    min_pix = 50        #minimum pixel count
+    
+    out_img = np.dstack((warped_binary, warped_binary, warped_binary)) * 255
+
+    #Window height
+    window_height = np.int(warped_binary.shape[0]/window_num)
+    
+    #Get nonzero values in the image
+    nonzero = warped_binary.nonzero()
+    nonzero_y = np.array(nonzero[0])
+    nonzero_x = np.array(nonzero[1])
+    
+    #Initialize
+    left_lane_inds = []
+    right_lane_inds = []
+    leftx_current = left_peak
+    rightx_current = right_peak
+    
+    for window in range(window_num):
+        
+        # Identify window boundaries in x and y (and right and left)
+        win_y_low = warped_binary.shape[0] - (window + 1) * window_height
+        win_y_high = warped_binary.shape[0] - window * window_height
+        win_xleft_low = leftx_current - margin
+        win_xleft_high = leftx_current + margin
+        win_xright_low = rightx_current - margin
+        win_xright_high = rightx_current + margin
+        cv.rectangle(out_img,(win_xleft_low,win_y_low),(win_xleft_high,win_y_high), (0,255,0), 1)
+        cv.rectangle(out_img,(win_xright_low,win_y_low),(win_xright_high,win_y_high), (0,255,0), 1)
+        
+        # Identify the nonzero pixels in x and y within the window
+        good_left_inds = ((nonzero_y >= win_y_low) & (nonzero_y < win_y_high) & 
+                          (nonzero_x >= win_xleft_low) & (nonzero_x < win_xleft_high)).nonzero()[0]
+        good_right_inds = ((nonzero_y >= win_y_low) & (nonzero_y < win_y_high) & 
+                           (nonzero_x >= win_xright_low) & (nonzero_x < win_xright_high)).nonzero()[0]
+        
+        # Append these indices to the lists
+        left_lane_inds.append(good_left_inds)
+        right_lane_inds.append(good_right_inds)
+        
+        # If you found > minpix pixels, recenter next window on their mean position
+        if len(good_left_inds) > min_pix:
+            leftx_current = np.int(np.mean(nonzero_x[good_left_inds]))
+        if len(good_right_inds) > min_pix:        
+            rightx_current = np.int(np.mean(nonzero_x[good_right_inds]))
+    
+    #Concatenate array of indices
+    left_lane_inds = np.concatenate(left_lane_inds)
+    right_lane_inds = np.concatenate(right_lane_inds)
+    
+    #Extract left and right line pixel positions
+    left_x = nonzero_x[left_lane_inds]
+    left_y = nonzero_y[left_lane_inds]
+    right_x = nonzero_x[right_lane_inds]
+    right_y = nonzero_y[right_lane_inds]
+    
+    plot_y = np.linspace(0, warped_binary.shape[0]-1, warped_binary.shape[0])
+    
+    #Check if vectors are empty
+    if not left_x.size > 0 and not left_y.size > 0:
+        print('Left is empty')
+        left_empty = True
+    else:
+        left_empty = False
+
+    if not right_x.size > 0 and not right_y.size > 0:
+        print('Right is empty')
+        right_empty = True
+    else:
+        right_empty = False
+    
+    if left_empty == False:
+        #Fit a second order polynomial to each
+        left_fit = np.polyfit(left_y, left_x, 2)
+        #Generate x and y values for plotting
+        left_fit_x = left_fit[0]*plot_y**2 + left_fit[1]*plot_y + left_fit[2]
+        out_img[nonzero_y[left_lane_inds], nonzero_x[left_lane_inds]] = [255,0,0]
+    else:
+        #Pass empty vectors
+        left_fit_x = []
+        
+    if right_empty == False:
+        right_fit = np.polyfit(right_y, right_x, 2)
+        right_fit_x = right_fit[0]*plot_y**2 +right_fit[1]*plot_y + right_fit[2]
+        out_img[nonzero_y[right_lane_inds], nonzero_x[right_lane_inds]] = [0,0,255]
+    else:
+        #Pass empty vectors
+        right_fit_x = []
+    
+    #Set detection status
+    if left_empty == False and right_empty == False:    #Both lanes detected
+        detection_status = 0
+        approx_lane = 0
+    elif left_empty == False and right_empty == True:   #Left only detected
+        detection_status = 1
+    elif left_empty == True and right_empty == False:   #Right only detected
+        detection_status = 2
+    elif left_empty == True and right_empty == True:    #No lanes detected
+        detection_status = 3
+    
+    
+    #Construct undetected lane approximation
+    approx_pix_off = 120
+    if detection_status == 1:   #left only detection
+        approx_lane = 2 #indicate the approximated lane (none = 0, left = 1, right = 2)
+        for pnt in left_fit_x:
+            right_fit_approx = pnt + approx_pix_off
+            right_fit_x.append(right_fit_approx)
+    if detection_status == 2:   #right only detection
+        approx_lane = 1 #indicate the approximated lane (none = 0, left = 1, right = 2)
+        for pnt in right_fit_x:
+            left_fit_approx = pnt - approx_pix_off
+            left_fit_x.append(left_fit_approx)
+    
+    #Plot
+    f, axarr = plt.subplots(1,1)
+    f.set_size_inches(18, 10)
+    axarr.imshow(out_img)
+    #if left_empty == False: 
+    axarr.plot(left_fit_x, plot_y, color='yellow')
+    #if right_empty == False:
+    axarr.plot(right_fit_x, plot_y, color='yellow')
+    plt.xlim(0,1280)
+    plt.ylim(720,0)
+    font = {'family':'serif','color':'black','size':15}
+    plt.title('Polynomial Lane Line Fitting', fontdict=font)
+    plt.xlabel('IPM Image Width [pixels]', fontdict=font)
+    plt.ylabel('IPM Image Height [pixels]', fontdict=font)
+    plt.show()
+    
+    #Return detected lanes
+    return detection_status, approx_lane, left_fit_x, right_fit_x, plot_y
+
+    
+#----- Project Lane Lines -----
+def projectLanes(detection_status, approx_lane, frame, warped_binary, plot_y, left_fit_x, right_fit_x, inv_trans_mat):
+
+    #Proccess if there are detections
+    if detection_status != 3:
+        
+        #Create canvas image
+        warp_zero = np.zeros_like(warped_binary).astype(np.uint8)
+        color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+
+        left_pts = np.array([np.transpose(np.vstack([left_fit_x, plot_y]))])
+        right_pts = np.array([np.flipud(np.transpose(np.vstack([right_fit_x, plot_y])))])    
+        pts = np.hstack((left_pts, right_pts))
+        left_pts_int = left_pts.astype(np.int32)
+        right_pts_int = right_pts.astype(np.int32)
+        
+        #Draw lane lines and fill lane in warped image
+        cv.polylines(color_warp, left_pts_int, False, (0,255,255), 2)
+        cv.polylines(color_warp, right_pts_int, False, (0,255,255), 2)
+        if approx_lane == 0:    #No approximated lanes
+            cv.fillPoly(color_warp, np.int_([pts]), (255,0,0))
+        if approx_lane == 1:    #left lane approximated
+            cv.fillPoly(color_warp, np.int_([pts]), (0,140,255))
+        if approx_lane == 2:    #right lane approximated
+            cv.fillPoly(color_warp, np.int_([pts]), (0,140,255))
+
+        
+        #Correct warping using inverse transformation matrix
+        new_warp = cv.warpPerspective(color_warp, inv_trans_mat, (frame.shape[1], frame.shape[0]))
+        lane_frame = cv.addWeighted(frame, 1, new_warp, 0.4, 0)
+        
+        #Unflipped right points
+        right_pts_uf = np.array([np.transpose(np.vstack([right_fit_x, plot_y]))])
+        right_pts_uf_int = right_pts_uf.astype(np.int32)
+
+        left_bounds = []
+        right_bounds = []
+        for i in range(len(left_pts_int[0])):
+            
+            #Lane points in IPM coordinates
+            left_pt_ipm = left_pts_int[0,i]
+            right_pt_ipm = right_pts_uf_int[0,i]
+            
+            #Convert lane points in original coordinates
+            left_pt_orig_x = round((inv_trans_mat[0,0] * left_pt_ipm[0] + inv_trans_mat[0,1] * left_pt_ipm[1] + inv_trans_mat[0,2]) / (inv_trans_mat[2,0] * left_pt_ipm[0] + inv_trans_mat[2,1] * left_pt_ipm[1] + inv_trans_mat[2,2]))
+            left_pt_orig_y = round((inv_trans_mat[1,0] * left_pt_ipm[0] + inv_trans_mat[1,1] * left_pt_ipm[1] + inv_trans_mat[1,2]) / (inv_trans_mat[2,0] * left_pt_ipm[0] + inv_trans_mat[2,1] * left_pt_ipm[1] + inv_trans_mat[2,2]))
+            right_pt_orig_x = round((inv_trans_mat[0,0] * right_pt_ipm[0] + inv_trans_mat[0,1] * right_pt_ipm[1] + inv_trans_mat[0,2]) / (inv_trans_mat[2,0] * right_pt_ipm[0] + inv_trans_mat[2,1] * right_pt_ipm[1] + inv_trans_mat[2,2]))
+            right_pt_orig_y = round((inv_trans_mat[1,0] * right_pt_ipm[0] + inv_trans_mat[1,1] * right_pt_ipm[1] + inv_trans_mat[1,2]) / (inv_trans_mat[2,0] * right_pt_ipm[0] + inv_trans_mat[2,1] * right_pt_ipm[1] + inv_trans_mat[2,2]))    
+            
+            left_pt_x_int = left_pt_orig_x.astype(np.int32)
+            left_pt_y_int = left_pt_orig_y.astype(np.int32)
+            right_pt_x_int = right_pt_orig_x.astype(np.int32)
+            right_pt_y_int = right_pt_orig_y.astype(np.int32)
+            
+            left_pt = (left_pt_x_int, left_pt_y_int)
+            right_pt = (right_pt_x_int, right_pt_y_int)
+
+            left_bounds.append(left_pt)
+            right_bounds.append(right_pt)
+        
+        #Draw bounds
+        left_bounds_arr = np.array(left_bounds)
+        right_bounds_arr = np.array(right_bounds)
+        if approx_lane == 0:    #No approximated lanes
+            cv.polylines(lane_frame, [left_bounds_arr], False, (0,255,65), 2)
+            cv.polylines(lane_frame, [right_bounds_arr], False, (0,255,65), 2)
+        if approx_lane == 1:    #Left lane approximated  
+            cv.polylines(lane_frame, [left_bounds_arr], False, (0,0,255), 2)
+            cv.polylines(lane_frame, [right_bounds_arr], False, (0,255,65), 2)
+        if approx_lane == 2:    #Right lane approximated
+            cv.polylines(lane_frame, [left_bounds_arr], False, (0,255,65), 2)
+            cv.polylines(lane_frame, [right_bounds_arr], False, (0,0,255), 2)
+
+    #No lanes detected
+    else:
+        #Pass empty vectors
+        left_bounds = []
+        right_bounds = []
+        lane_frame = frame.copy() #return raw frame
+        
+    return lane_frame, left_bounds, right_bounds
+    
+#----- Localize Ego Vehicle -----
+def localizeEgo(detection_status, lane_frame, left_bounds, right_bounds, vert_vanish_point):
+
+    #Camera origin in image plane
+    cam_orig = (lane_frame.shape[1]/2, lane_frame.shape[0])
+    
+    #Camera focal length in pixels
+    focal_length = 2.8669527693619584e+03
+    
+    #Height of camera
+    camera_height = 2.27
+    
+    #Set lanewidth in m (average ~3.7m)
+    lane_width_m = 3.7
+        
+    #Only process both lanes for now
+    if detection_status != 3:       
+         
+        #Generate center of lane
+        lane_width_vect = []
+        lane_center_list = []
+        range_vect = []
+        c_off_vect = []
+        l_off_vect = []
+        r_off_vect = []
+        width_est_vect = []
+        range_vect_vp = []
+        c_off_vect_vp = []
+        l_off_vect_vp = []
+        r_off_vect_vp = []
+        width_est_vect_vp = []
+        
+        for j in range(len(left_bounds)):
+            
+            left_pt = left_bounds[j]
+            right_pt = right_bounds[j]
+            
+            #lane_width_px = math.dist(left_pt, right_pt)
+            lane_width_px = np.abs(left_pt[0] - right_pt[0])
+            lane_width_vect.append(lane_width_px)
+            
+            lane_center = (round(lane_width_px / 2 + left_pt[0]), left_pt[1])
+            lane_center_list.append(lane_center)
+            
+            #Generate range to center ()
+            range_est = focal_length * (lane_width_m / lane_width_px)
+            
+            #Generate lateral offset to lane boundaries
+            lat_off_px_c = np.abs(lane_center[0] - cam_orig[0])
+            lat_off_px_l = cam_orig[0] - left_pt[0]
+            lat_off_px_r = np.abs(cam_orig[0] - right_pt[0])
+            
+            lat_off_m_c = lat_off_px_c * range_est / focal_length
+            lat_off_m_l = lat_off_px_l * range_est / focal_length
+            lat_off_m_r = lat_off_px_r * range_est / focal_length
+            lane_width_est = lat_off_m_l + lat_off_m_r
+            
+            #Append vectors
+            range_vect.append(range_est)
+            c_off_vect.append(lat_off_m_c)
+            l_off_vect.append(lat_off_m_l)
+            r_off_vect.append(lat_off_m_r)
+            width_est_vect.append(lane_width_est)
+            
+            #Estimate using vanishing point
+            range_est_vp = (focal_length * camera_height) / (lane_center[1] - vert_vanish_point)
+            lat_off_m_c_vp = lat_off_px_c * range_est_vp / focal_length
+            lat_off_m_l_vp = lat_off_px_l * range_est_vp / focal_length
+            lat_off_m_r_vp = lat_off_px_r * range_est_vp / focal_length
+            lane_width_est_vp = lat_off_m_l_vp + lat_off_m_r_vp
+            
+            #Append vectors
+            range_vect_vp.append(range_est_vp)
+            c_off_vect_vp.append(lat_off_m_c_vp)
+            l_off_vect_vp.append(lat_off_m_l_vp)
+            r_off_vect_vp.append(lat_off_m_r_vp)
+            width_est_vect_vp.append(lane_width_est_vp)
+            
+        #Convert lane center to array
+        lane_center_arr = np.array(lane_center_list)
+        lane_center_arr = lane_center_arr.astype(np.int32)
+        #cv.polylines(lane_frame, [lane_center_arr], False, (0,0,255), 2)
+        
+        #Display localization info from closest lane points
+        print('\nLocalization (SS):')
+        print(f'Center: {lat_off_m_c} m')
+        print(f'Left: {lat_off_m_l} m')
+        print(f'Right: {lat_off_m_r} m')
+        print(f'Lane Width: {lane_width_est}')
+        
+        print('\nLocalization (VP):')
+        print(f'Center: {lat_off_m_c_vp} m')
+        print(f'Left: {lat_off_m_l_vp} m')
+        print(f'Right: {lat_off_m_r_vp} m')
+        print(f'Lane Width: {lane_width_est_vp}')
+    
+    else:
+        #Pass empty vectors
+        range_vect = []
+        c_off_vect = []
+        l_off_vect = []
+        r_off_vect = []
+        range_vect_vp = []
+        
+    return range_vect, c_off_vect, l_off_vect, r_off_vect, range_vect_vp, width_est_vect, width_est_vect_vp
+    
+#----- Run Functions -----
+def run():
+    
+    #Read image
+    input_path = '/home/tahnt/T3_Repos/post_process_packages/ros2_ws/src/lane_detection_package/data/images/frame1265.jpg'
+    frame = readImage(input_path)
+    frame_cp = frame.copy()
+    
+    #Display raw image
+    cv.imshow('Raw', frame)
+    cv.waitKey(0)
+    
+    #Run YOLO
+    indices, boxes, width_vect, bottom_vect = runYolo(frame)
+    
+    #Binary thresholding
+    binary_bl = binaryThresholding(frame_cp)
+    
+    #Mask image
+    mask, masked_binary = maskImage(binary_bl, indices, boxes, frame)
+    masked_binary_plot = masked_binary * 255
+    cv.imshow("Masked Image", masked_binary_plot)
+    cv.waitKey(0)
+    
+    #Vanishing Point via Hough lines
+    vert_vanish_point = vanishPoint(frame, mask)
+    print(f'Vanishing point: {vert_vanish_point}')
+    
+    #Virtual Horizon via vehicle detections
+    virtual_horizon = virtHorizon(frame, width_vect, bottom_vect)
+    print(f'Virtual Horizon: {virtual_horizon}')
+    
+    #Inverse persepective transform
+    warped_binary, inv_trans_mat = invPersTrans(masked_binary, frame_cp)
+    warped_binary_plot = warped_binary * 255
+    cv.imshow("IPM Binary", warped_binary_plot)
+    cv.waitKey(0)
+    
+    #Histogram
+    left_peak, right_peak = histogram(warped_binary)
+    
+    #Sliding window
+    detection_status, approx_lane, left_fit_x, right_fit_x, plot_y = slidingWindow(warped_binary, left_peak, right_peak)
+    
+    #Project lane detections to raw frame
+    lane_frame, left_bounds, right_bounds = projectLanes(detection_status, approx_lane, frame, warped_binary, plot_y, left_fit_x, right_fit_x, inv_trans_mat)
+    
+    #Localize ego within lane boundaries
+    range_vect, c_off_vect, l_off_vect, r_off_vect, range_vect_vp, width_est_vect, width_est_vect_vp = localizeEgo(detection_status, lane_frame, left_bounds, right_bounds, vert_vanish_point)
+    
+    #Display final output
+    cv.imshow("Lane Detections", lane_frame)
+    cv.waitKey(0)
+    
+    #Plot depth estimate
+    t = np.linspace(0,frame.shape[0], 720)
+    plt.plot(t, np.flipud(range_vect), 'r', label = 'Static Size')
+    plt.plot(t, np.flipud(range_vect_vp), 'b', label = 'Virtual Horizon')
+    plt.legend(loc='upper left')
+    font = {'family':'serif','color':'black','size':15}
+    plt.title('Image Depth Estimate from Lane Detection', fontdict=font)
+    plt.xlabel('Lane Points [pixels]', fontdict=font)
+    plt.ylabel('Range [m]', fontdict=font)
+    plt.show()
+    
+    #Plot lane width estimate
+    plt.plot(t, np.flipud(width_est_vect), 'r', label = 'Static Size')
+    plt.plot(t, np.flipud(width_est_vect_vp), 'b', label = 'Virtual Horizon')
+    plt.legend(loc='upper left')
+    font = {'family':'serif','color':'black','size':15}
+    plt.title('Lane Width Estimate', fontdict=font)
+    plt.xlabel('Lane Points [pixels]', fontdict=font)
+    plt.ylabel('Lane Width [m]', fontdict=font)
+    plt.show()
+
+    
+if __name__ == '__main__':
+    print('Lane Detection Started ...\n')
+    run()
+    print('\nProccessing Complete')
